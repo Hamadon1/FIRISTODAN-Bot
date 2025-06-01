@@ -1,449 +1,444 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Боти Telegram барои интишори ҳаррӯзаи филмҳо дар канал
+Эҷодкунанда: Claude
+Таърих: 2025
+"""
+
 import telebot
-from telebot import types
-import sqlite3
+import json
+import logging
 import schedule
 import time
 import threading
 from datetime import datetime, timedelta
-import os
+from typing import Dict, List, Optional
 
-# Танзимоти бот
-BOT_TOKEN = "7268398403:AAGsmC5e19hOexTV8nSaKUwbaq5wbjYKUg8"  # Токени ботатонро дар ин ҷо гузоред
-ADMIN_ID = 6862331593  # ID админро дар ин ҷо гузоред
-CHANNEL_USERNAME = "@kinohoijazob"  # Номи канал (бо @)
-DB_NAME = 'movies_v2.db' # Номи файли базаи додаҳо
+# ==================== ТАНЗИМОТ (КОНФИГУРАТСИЯ) ====================
+BOT_TOKEN = "7007180291:AAGA9O0UCbs6gB2SAme4h2FCOKD9GovagP0"  # Token-и ботатонро дар ин ҷо ворид кунед
+ADMIN_USER_ID = 6862331593  # ID-и Telegram-и администратор (танҳо рақам)
+CHANNEL_ID = "@kinohoijazob"  # ID-и канал ё username (масалан @mychannel ё -100xxxxxxxxxx)
+DATA_FILE = "bot_data.json"  # Номи файли JSON барои захираи маълумот
+MAX_QUEUE_SIZE = 10  # Шумораи максималии филмҳо дар навбат
+DEFAULT_POST_TIME = "10:00"  # Вақти пешфарз барои интишор
 
-# Ҳолатҳои корбар барои идоракунии ҷараён
-USER_STATE_NONE = 0
-USER_STATE_WAITING_MOVIE_FILE = 1
-USER_STATE_WAITING_MOVIE_TITLE = 2
-USER_STATE_WAITING_MOVIE_DESCRIPTION = 3
-USER_STATE_WAITING_DELETE_MOVIE_ID = 4
-USER_STATE_WAITING_PUBLISH_NOW_MOVIE_ID = 5
+# ==================== ТАНЗИМИ LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-user_data = {} # Барои нигоҳ доштани маълумоти муваққатии корбар ҳангоми иловаи филм
-
+# ==================== ИНИТСИАЛИЗАТСИЯИ БОТ ====================
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- Функсияҳои базаи додаҳо ---
-def init_database():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS movies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            is_published BOOLEAN DEFAULT FALSE,
-            created_date DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS publish_schedule (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            movie_id INTEGER UNIQUE,
-            publish_date DATE NOT NULL,
-            is_published BOOLEAN DEFAULT FALSE,
-            FOREIGN KEY (movie_id) REFERENCES movies (id) ON DELETE CASCADE
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def save_movie_to_db(title, description, file_id, file_type):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO movies (title, description, file_id, file_type)
-        VALUES (?, ?, ?, ?)
-    ''', (title, description, file_id, file_type))
-    movie_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return movie_id
-
-def schedule_movie(movie_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+# ==================== СТРУКТУРАИ МАЪЛУМОТ ====================
+class BotData:
+    def __init__(self):
+        self.movie_queue: List[Dict] = []  # Навбати филмҳо
+        self.post_time: str = DEFAULT_POST_TIME  # Вақти интишор
+        self.last_post_date: str = ""  # Таърихи охирин интишор
     
-    # Санаи охирини нашрро ёфтан
-    cursor.execute("SELECT MAX(publish_date) FROM publish_schedule")
-    last_publish_date_str = cursor.fetchone()[0]
+    def to_dict(self) -> Dict:
+        """Табдил додани маълумот ба dict барои JSON"""
+        return {
+            'movie_queue': self.movie_queue,
+            'post_time': self.post_time,
+            'last_post_date': self.last_post_date
+        }
     
-    next_publish_date = datetime.now().date() + timedelta(days=1) # Агар ҷадвал холӣ бошад
-    if last_publish_date_str:
-        last_publish_date = datetime.strptime(last_publish_date_str, '%Y-%m-%d').date()
-        if last_publish_date >= next_publish_date: # Агар санаи охирин аз фардо дертар бошад
-             next_publish_date = last_publish_date + timedelta(days=1)
-        # Агар санаи охирин дар гузашта бошад, аз фардо сар мекунем
-        elif last_publish_date < datetime.now().date():
-             next_publish_date = datetime.now().date() + timedelta(days=1)
+    def from_dict(self, data: Dict):
+        """Бор кардани маълумот аз dict"""
+        self.movie_queue = data.get('movie_queue', [])
+        self.post_time = data.get('post_time', DEFAULT_POST_TIME)
+        self.last_post_date = data.get('last_post_date', "")
 
+# ==================== ГЛОБАЛИИ МАЪЛУМОТ ====================
+bot_data = BotData()
 
-    cursor.execute('''
-        INSERT INTO publish_schedule (movie_id, publish_date)
-        VALUES (?, ?)
-    ''', (movie_id, next_publish_date.strftime('%Y-%m-%d')))
-    conn.commit()
-    conn.close()
-    return next_publish_date
+# ==================== ФУНКСИЯҲОИ КУМАКӢ ====================
+def save_data():
+    """Захираи маълумот ба файли JSON"""
+    try:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(bot_data.to_dict(), f, ensure_ascii=False, indent=2)
+        logger.info("Маълумот бомуваффақият захира шуд")
+    except Exception as e:
+        logger.error(f"Хатогӣ ҳангоми захираи маълумот: {e}")
 
-def get_movie_by_id(movie_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, description, file_id, file_type FROM movies WHERE id = ?", (movie_id,))
-    movie = cursor.fetchone()
-    conn.close()
-    return movie
+def load_data():
+    """Бор кардани маълумот аз файли JSON"""
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        bot_data.from_dict(data)
+        logger.info("Маълумот бомуваффақият бор карда шуд")
+    except FileNotFoundError:
+        logger.info("Файли маълумот ёфт нашуд, маълумоти нав эҷод мешавад")
+        save_data()
+    except Exception as e:
+        logger.error(f"Хатогӣ ҳангоми бор кардани маълумот: {e}")
 
-def delete_movie_from_db(movie_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # ON DELETE CASCADE бояд филмро аз publish_schedule низ тоза кунад
-    cursor.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
-    deleted_rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return deleted_rows > 0
+def is_admin(user_id: int) -> bool:
+    """Санҷиши ҳуқуқи администратор"""
+    return user_id == ADMIN_USER_ID
 
-def get_pending_movies():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT m.id, m.title, ps.publish_date
-        FROM movies m
-        JOIN publish_schedule ps ON m.id = ps.movie_id
-        WHERE ps.is_published = FALSE
-        ORDER BY ps.publish_date ASC
-    ''')
-    movies = cursor.fetchall()
-    conn.close()
-    return movies
-
-# --- Функсияҳои ёрирасон ---
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-def set_user_state(user_id, state):
-    user_data.setdefault(user_id, {})['state'] = state
-
-def get_user_state(user_id):
-    return user_data.get(user_id, {}).get('state', USER_STATE_NONE)
-
-def clear_user_data(user_id):
-    if user_id in user_data:
-        del user_data[user_id]
-
-def create_main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_add = types.KeyboardButton("➕ Иловаи филм")
-    btn_pending = types.KeyboardButton("🗓 Рӯйхати интизорӣ")
-    btn_publish_now = types.KeyboardButton("🚀 Нашри фаврӣ")
-    btn_delete = types.KeyboardButton("🗑️ Тоза кардани филм")
-    btn_status = types.KeyboardButton("📊 Ҳолати бот")
-    btn_help = types.KeyboardButton("❓ Кӯмак")
-    markup.add(btn_add, btn_pending, btn_publish_now, btn_delete, btn_status, btn_help)
-    return markup
-
-def create_cancel_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    markup.add(types.KeyboardButton("↪️ Бекор кардан"))
-    return markup
-
-# --- Функсияҳои нашр ---
-def publish_movie_to_channel(movie_id_to_publish=None, scheduled_publish=True):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    movie_to_post = None
-    schedule_id_to_update = None
-
-    if movie_id_to_publish: # Барои нашри фаврӣ
-        cursor.execute('''
-            SELECT m.id, m.title, m.description, m.file_id, m.file_type, ps.id 
-            FROM movies m
-            LEFT JOIN publish_schedule ps ON m.id = ps.movie_id
-            WHERE m.id = ? AND m.is_published = FALSE
-        ''', (movie_id_to_publish,))
-        result = cursor.fetchone()
-        if result:
-            movie_id, title, description, file_id, file_type, schedule_id = result
-            movie_to_post = (movie_id, title, description, file_id, file_type)
-            schedule_id_to_update = schedule_id # Метавонад None бошад, агар филм ҳанӯз ба ҷадвал илова нашуда бошад
-    
-    elif scheduled_publish: # Барои нашри муқаррарӣ аз рӯи ҷадвал
-        today = datetime.now().date().strftime('%Y-%m-%d')
-        cursor.execute('''
-            SELECT ps.id, m.title, m.description, m.file_id, m.file_type, ps.movie_id
-            FROM publish_schedule ps
-            JOIN movies m ON ps.movie_id = m.id
-            WHERE ps.publish_date = ? AND ps.is_published = FALSE AND m.is_published = FALSE
-            ORDER BY ps.id ASC LIMIT 1 
-        ''', (today,)) # Танҳо якто дар як рӯз
-        result = cursor.fetchone()
-        if result:
-            schedule_id, title, description, file_id, file_type, movie_id = result
-            movie_to_post = (movie_id, title, description, file_id, file_type)
-            schedule_id_to_update = schedule_id
-
-    if movie_to_post:
-        movie_id, title, description, file_id, file_type = movie_to_post
-        caption = f"🎬 **{title}**\n\n{description if description else ''}\n\nКанали мо: {CHANNEL_USERNAME}"
+def get_next_post_time() -> str:
+    """Гирифтани вақти интишори навбатӣ"""
+    try:
+        now = datetime.now()
+        post_hour, post_minute = map(int, bot_data.post_time.split(':'))
         
+        # Муайян кардани таърихи интишори навбатӣ
+        next_post = now.replace(hour=post_hour, minute=post_minute, second=0, microsecond=0)
+        
+        # Агар вақт гузашта бошад, барои фардо муайян мекунем
+        if next_post <= now:
+            next_post += timedelta(days=1)
+        
+        return next_post.strftime("%Y-%m-%d %H:%M")
+    except Exception as e:
+        logger.error(f"Хатогӣ ҳангоми ҳисоби вақти навбатӣ: {e}")
+        return "Номуайян"
+
+def post_movie():
+    """Интишори филми навбатӣ дар канал"""
+    try:
+        if not bot_data.movie_queue:
+            logger.info("Навбати филмҳо холӣ аст")
+            return
+        
+        # Гирифтани филми аввал аз навбат
+        movie = bot_data.movie_queue.pop(0)
+        
+        # Интишори филм дар канал
+        bot.send_video(
+            chat_id=CHANNEL_ID,
+            video=movie['file_id'],
+            caption=movie.get('caption', ''),
+            parse_mode='HTML'
+        )
+        
+        # Навсозии таърихи охирин интишор
+        bot_data.last_post_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Захираи маълумот
+        save_data()
+        
+        logger.info(f"Филм бомуваффақият интишор шуд: {movie.get('caption', 'Бе сарлавҳа')}")
+        
+        # Огоҳ кардани администратор
         try:
-            if file_type == 'video':
-                bot.send_video(CHANNEL_USERNAME, file_id, caption=caption, parse_mode="Markdown")
-            elif file_type == 'document':
-                bot.send_document(CHANNEL_USERNAME, file_id, caption=caption, parse_mode="Markdown")
-            
-            # Нишондодани ҳамчун нашршуда
-            cursor.execute("UPDATE movies SET is_published = TRUE WHERE id = ?", (movie_id,))
-            if schedule_id_to_update: # Агар дар ҷадвал бошад
-                 cursor.execute("UPDATE publish_schedule SET is_published = TRUE WHERE id = ?", (schedule_id_to_update,))
-            elif not scheduled_publish and movie_id_to_publish: # Агар нашри фаврӣ ва дар ҷадвал набошад, онро ҳамчун нашршуда илова мекунем
-                cursor.execute('''
-                    INSERT OR IGNORE INTO publish_schedule (movie_id, publish_date, is_published)
-                    VALUES (?, ?, TRUE)
-                ''', (movie_id, datetime.now().date().strftime('%Y-%m-%d')))
-
-            conn.commit()
-            bot.send_message(ADMIN_ID, f"✅ Филми '{title}' (ID: {movie_id}) бомуваффақият дар канал нашр шуд!")
-
-            if scheduled_publish: # Танҳо барои нашри муқаррарӣ
-                cursor.execute('SELECT COUNT(*) FROM publish_schedule WHERE is_published = FALSE')
-                remaining = cursor.fetchone()[0]
-                if remaining == 0:
-                    bot.send_message(ADMIN_ID, "🎉 Ҳамаи филмҳои ба нақша гирифташуда нашр шуданд!")
-            
+            bot.send_message(
+                ADMIN_USER_ID,
+                f"✅ Филм бомуваффақият интишор шуд!\n\n"
+                f"📝 Сарлавҳа: {movie.get('caption', 'Бе сарлавҳа')}\n"
+                f"⏰ Вақт: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                f"📊 Филмҳои боқимонда дар навбат: {len(bot_data.movie_queue)}"
+            )
         except Exception as e:
-            bot.send_message(ADMIN_ID, f"❌ Хатогӣ ҳангоми нашри филми '{title}' (ID: {movie_id}): {str(e)}")
-    
-    conn.close()
-
-# --- Ҳендлерҳои Telegram ---
-@bot.message_handler(commands=['start'])
-def start_command(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "⛔ Шумо иҷозати истифодаи ин ботро надоред.")
-        return
-    
-    clear_user_data(message.from_user.id)
-    set_user_state(message.from_user.id, USER_STATE_NONE)
-    bot.send_message(message.chat.id, 
-                     "👋 Салом, Администратор!\n\n"
-                     "Интихоб кунед, ки чӣ кор кардан мехоҳед:",
-                     reply_markup=create_main_menu())
-
-@bot.message_handler(commands=['help'])
-def help_command(message):
-    if not is_admin(message.from_user.id): return
-    help_text = (
-        "📖 **Дастурамали кӯтоҳ:**\n\n"
-        "🔹 **➕ Иловаи филм:** Барои илова кардани филми нав ба база ва ба нақша гирифтани он.\n"
-        "🔹 **🗓 Рӯйхати интизорӣ:** Намоиши филмҳое, ки барои нашр дар навбатанд.\n"
-        "🔹 **🚀 Нашри фаврӣ:** Интихоб ва нашри фаврии як филм.\n"
-        "🔹 **🗑️ Тоза кардани филм:** Тоза кардани филм аз база ва ҷадвали нашр.\n"
-        "🔹 **📊 Ҳолати бот:** Маълумот дар бораи филмҳои дар база буда.\n"
-        "🔹 **↪️ Бекор кардан:** Барои бекор кардани амалиёти ҷорӣ.\n"
-        "🔹 **❓ Кӯмак:** Намоиши ин дастурамал.\n\n"
-        f"🕒 Филмҳо ҳар рӯз соати 12:00 ба таври худкор дар канали {CHANNEL_USERNAME} нашр мешаванд."
-    )
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown", reply_markup=create_main_menu())
-
-# Ҳендлери умумӣ барои матн ва тугмаҳо
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "⛔ Шумо иҷозати истифодаи ин ботро надоред.")
-        return
-
-    user_id = message.from_user.id
-    current_state = get_user_state(user_id)
-    
-    if message.text == "↪️ Бекор кардан":
-        clear_user_data(user_id)
-        set_user_state(user_id, USER_STATE_NONE)
-        bot.send_message(user_id, "🔄 Амалиёт бекор карда шуд.", reply_markup=create_main_menu())
-        return
-
-    # --- Амалиётҳои асосӣ ---
-    if message.text == "➕ Иловаи филм":
-        set_user_state(user_id, USER_STATE_WAITING_MOVIE_FILE)
-        user_data[user_id]['current_movie'] = {}
-        bot.send_message(user_id, "🎬 Файли филмро (видео ё ҳуҷҷат) ирсол кунед:", reply_markup=create_cancel_keyboard())
-    
-    elif message.text == "🗓 Рӯйхати интизорӣ":
-        pending_movies = get_pending_movies()
-        if not pending_movies:
-            bot.send_message(user_id, "📭 Ҳоло филмҳои дар навбатбуда мавҷуд нестанд.", reply_markup=create_main_menu())
-            return
-        
-        response = "🗓 **Филмҳои дар навбати нашр:**\n\n"
-        for i, (movie_id, title, publish_date) in enumerate(pending_movies):
-            try:
-                # Табдили сана ба формати хоно
-                date_obj = datetime.strptime(publish_date, '%Y-%m-%d')
-                formatted_date = date_obj.strftime('%d %B %Y')
-            except ValueError:
-                formatted_date = publish_date # Агар формат дигар бошад
-            response += f"{i+1}. (ID: `{movie_id}`) **{title}** - {formatted_date}\n"
-        
-        # Агар рӯйхат хеле дароз бошад, онро тақсим кардан лозим меояд.
-        # Ҳоло, агар аз 4096 аломат зиёд бошад, огоҳӣ медиҳем.
-        if len(response) > 4096:
-            bot.send_message(user_id, response[:4090] + "\n...", parse_mode="Markdown", reply_markup=create_main_menu())
-            bot.send_message(user_id, "⚠️ Рӯйхат хеле дароз аст, танҳо қисме нишон дода шуд.", reply_markup=create_main_menu())
-        else:
-            bot.send_message(user_id, response, parse_mode="Markdown", reply_markup=create_main_menu())
-
-    elif message.text == "🚀 Нашри фаврӣ":
-        set_user_state(user_id, USER_STATE_WAITING_PUBLISH_NOW_MOVIE_ID)
-        bot.send_message(user_id, "🆔 ID-и филмеро, ки мехоҳед ҳозир нашр кунед, ворид намоед (аз 'Рӯйхати интизорӣ' ёбед):", reply_markup=create_cancel_keyboard())
-
-    elif message.text == "🗑️ Тоза кардани филм":
-        set_user_state(user_id, USER_STATE_WAITING_DELETE_MOVIE_ID)
-        bot.send_message(user_id, "🆔 ID-и филмеро, ки мехоҳед тоза кунед, ворид намоед (аз 'Рӯйхати интизорӣ' ёбед):", reply_markup=create_cancel_keyboard())
-    
-    elif message.text == "📊 Ҳолати бот":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM movies')
-        total_movies = cursor.fetchone()[0]
-        cursor.execute('SELECT COUNT(*) FROM movies WHERE is_published = TRUE')
-        published_movies = cursor.fetchone()[0]
-        cursor.execute('SELECT COUNT(*) FROM publish_schedule WHERE is_published = FALSE')
-        scheduled_movies = cursor.fetchone()[0]
-        conn.close()
-        status_text = (f"📊 **Ҳолати бот:**\n\n"
-                       f"📹 Филмҳои умумӣ дар база: {total_movies}\n"
-                       f"✅ Филмҳои нашршуда: {published_movies}\n"
-                       f"⏳ Филмҳои дар навбати нашр: {scheduled_movies}\n")
-        bot.send_message(user_id, status_text, parse_mode="Markdown", reply_markup=create_main_menu())
-
-    elif message.text == "❓ Кӯмак":
-        help_command(message)
-        
-    # --- Идоракунии ҳолатҳо ---
-    elif current_state == USER_STATE_WAITING_MOVIE_TITLE:
-        title = message.text.strip()
-        if not title:
-            bot.send_message(user_id, "⚠️ Номи филм наметавонад холӣ бошад. Лутфан дубора ворид кунед:", reply_markup=create_cancel_keyboard())
-            return
-        user_data[user_id]['current_movie']['title'] = title
-        set_user_state(user_id, USER_STATE_WAITING_MOVIE_DESCRIPTION)
-        bot.send_message(user_id, "📝 Тавсифи мухтасари филмро ирсол кунед (ё '-' барои тавсифи холӣ):", reply_markup=create_cancel_keyboard())
-
-    elif current_state == USER_STATE_WAITING_MOVIE_DESCRIPTION:
-        description = message.text.strip()
-        if description == '-':
-            description = ""
-        
-        movie_data = user_data[user_id]['current_movie']
-        movie_id = save_movie_to_db(movie_data['title'], description, movie_data['file_id'], movie_data['file_type'])
-        
-        if movie_id:
-            publish_date = schedule_movie(movie_id)
-            bot.send_message(user_id, 
-                             f"✅ Филми '{movie_data['title']}' бомуваффақият сабт шуд (ID: {movie_id}).\n"
-                             f"📅 Барои нашр дар санаи {publish_date.strftime('%d %B %Y')} ба нақша гирифта шуд.", 
-                             reply_markup=create_main_menu())
-        else:
-            bot.send_message(user_id, "❌ Хатогӣ ҳангоми сабти филм. Лутфан дубора кӯшиш кунед.", reply_markup=create_main_menu())
-        
-        clear_user_data(user_id)
-        set_user_state(user_id, USER_STATE_NONE)
-
-    elif current_state == USER_STATE_WAITING_DELETE_MOVIE_ID:
+            logger.error(f"Хатогӣ ҳангоми огоҳкунии администратор: {e}")
+            
+    except Exception as e:
+        logger.error(f"Хатогӣ ҳангоми интишори филм: {e}")
         try:
-            movie_id_to_delete = int(message.text.strip())
-            movie = get_movie_by_id(movie_id_to_delete)
-            if movie:
-                if delete_movie_from_db(movie_id_to_delete):
-                    bot.send_message(user_id, f"🗑️ Филми '{movie[1]}' (ID: {movie_id_to_delete}) бомуваффақият тоза карда шуд.", reply_markup=create_main_menu())
-                else:
-                    bot.send_message(user_id, f"⚠️ Хатогӣ ҳангоми тоза кардани филм (ID: {movie_id_to_delete}).", reply_markup=create_main_menu())
-            else:
-                bot.send_message(user_id, f"🚫 Филм бо ID: {movie_id_to_delete} ёфт нашуд.", reply_markup=create_main_menu())
-        except ValueError:
-            bot.send_message(user_id, "⚠️ ID-и филм бояд рақам бошад. Лутфан дубора ворид кунед:", reply_markup=create_cancel_keyboard())
-            return # Дар ҳамин ҳолат мемонем
-        
-        clear_user_data(user_id) # Барои ин амал user_data истифода намешавад, аммо барои унификатсия
-        set_user_state(user_id, USER_STATE_NONE)
+            bot.send_message(
+                ADMIN_USER_ID,
+                f"❌ Хатогӣ ҳангоми интишори филм: {str(e)}"
+            )
+        except:
+            pass
 
-    elif current_state == USER_STATE_WAITING_PUBLISH_NOW_MOVIE_ID:
-        try:
-            movie_id_to_publish = int(message.text.strip())
-            movie = get_movie_by_id(movie_id_to_publish)
-            if movie:
-                if movie[0] in [m[0] for m in get_pending_movies()]: # Агар дар рӯйхати интизорӣ бошад
-                     bot.send_message(user_id, f"⏳ Омодагӣ ба нашри фаврии филми '{movie[1]}' (ID: {movie_id_to_publish})...", reply_markup=create_main_menu())
-                     publish_movie_to_channel(movie_id_to_publish=movie_id_to_publish, scheduled_publish=False)
-                else: # Агар аллакай нашр шудааст ё дар ҷадвал нест, аммо дар база ҳаст
-                    conn = sqlite3.connect(DB_NAME)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT is_published FROM movies WHERE id = ?", (movie_id_to_publish,))
-                    is_already_published = cursor.fetchone()
-                    conn.close()
-                    if is_already_published and is_already_published[0]:
-                         bot.send_message(user_id, f"ℹ️ Филми '{movie[1]}' (ID: {movie_id_to_publish}) аллакай нашр шудааст.", reply_markup=create_main_menu())
-                    else: # Дар база ҳаст, аммо дар ҷадвал нест ва нашр нашудааст (ҳолати нодир)
-                        bot.send_message(user_id, f"⏳ Омодагӣ ба нашри фаврии филми '{movie[1]}' (ID: {movie_id_to_publish})...", reply_markup=create_main_menu())
-                        publish_movie_to_channel(movie_id_to_publish=movie_id_to_publish, scheduled_publish=False)
+def setup_scheduler():
+    """Танзими ҷадвали интишор"""
+    schedule.clear()  # Пок кардани ҷадвали қаблӣ
+    schedule.every().day.at(bot_data.post_time).do(post_movie)
+    logger.info(f"Ҷадвали интишор танзим шуд барои соати {bot_data.post_time}")
 
-            else:
-                bot.send_message(user_id, f"🚫 Филм бо ID: {movie_id_to_publish} ёфт нашуд.", reply_markup=create_main_menu())
-        except ValueError:
-            bot.send_message(user_id, "⚠️ ID-и филм бояд рақам бошад. Лутфан дубора ворид кунед:", reply_markup=create_cancel_keyboard())
-            return
-        
-        clear_user_data(user_id)
-        set_user_state(user_id, USER_STATE_NONE)
-        
-    # Агар ягон тугмаи асосӣ пахш нашуда бошад ва ҳолати муайян набошад
-    elif current_state == USER_STATE_NONE and message.text not in ["➕ Иловаи филм", "🗓 Рӯйхати интизорӣ", "🚀 Нашри фаврӣ", "🗑️ Тоза кардани филм", "📊 Ҳолати бот", "❓ Кӯмак"]:
-        bot.send_message(user_id, "🤔 Фармони номаълум. Лутфан аз тугмаҳои меню истифода баред ё /help -ро пахш кунед.", reply_markup=create_main_menu())
-
-
-@bot.message_handler(content_types=['video', 'document'])
-def handle_media_files(message):
-    if not is_admin(message.from_user.id): return
-    user_id = message.from_user.id
-
-    if get_user_state(user_id) == USER_STATE_WAITING_MOVIE_FILE:
-        if message.content_type == 'video':
-            file_id = message.video.file_id
-            file_type = 'video'
-        elif message.content_type == 'document':
-            file_id = message.document.file_id
-            file_type = 'document'
-        else: # Набояд рӯй диҳад, зеро content_types филтр мекунад
-            bot.send_message(user_id, "⚠️ Лутфан файли видео ё ҳуҷҷатро ирсол кунед.", reply_markup=create_cancel_keyboard())
-            return
-
-        user_data[user_id].setdefault('current_movie', {})['file_id'] = file_id
-        user_data[user_id]['current_movie']['file_type'] = file_type
-        
-        set_user_state(user_id, USER_STATE_WAITING_MOVIE_TITLE)
-        bot.send_message(user_id, "✅ Файл қабул шуд!\n\n🖋️ Акнун номи филмро ирсол кунед:", reply_markup=create_cancel_keyboard())
-    else:
-        # Агар корбар файлро дар ҳолати нодуруст фиристад
-        bot.send_message(user_id, "⚠️ Ҳоло ман ин файлро интизор набудам. Агар филм илова карда истода бошед, лутфан аз аввал бо пахши '➕ Иловаи филм' оғоз кунед.", reply_markup=create_main_menu())
-
-
-# --- Функсияи заминавӣ барои банақшагирӣ ---
-def run_scheduler():
-    schedule.every().day.at("12:00").do(publish_movie_to_channel, scheduled_publish=True) 
-    # Шумо метавонед вақти дигарро муқаррар кунед, масалан: schedule.every().monday.at("10:30").do(job)
-    
-    bot.send_message(ADMIN_ID, f"⏰ Банақшагирандаи нашр фаъол шуд. Филмҳо ҳар рӯз соати 12:00 нашр мешаванд.")
+def scheduler_thread():
+    """Thread барои кори ҷадвал"""
     while True:
-        schedule.run_pending()
-        time.sleep(60) # Ҳар дақиқа санҷиш
+        try:
+            schedule.run_pending()
+            time.sleep(60)  # Санҷиш ҳар дақиқа
+        except Exception as e:
+            logger.error(f"Хатогӣ дар scheduler thread: {e}")
+            time.sleep(60)
 
-# --- Оғози бот ---
+# ==================== ФАРМОНҲОИ БОТ ====================
+
+@bot.message_handler(commands=['start', 'help'])
+def handle_start_help(message):
+    """Коркарди фармони /start ва /help"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    help_text = """
+🎬 **Боти интишори филмҳо**
+
+**Фармонҳои дастрас:**
+
+🎯 **Асосӣ:**
+• Барои илова кардани филм - танҳо файли видеоро фиристед
+• `/status` - Вазъи кунунӣ
+• `/listmovies` - Рӯйхати филмҳо дар навбат
+
+⚙️ **Идоракунӣ:**
+• `/remove <рақам>` - Нест кардани филм аз навбат
+• `/settime HH:MM` - Тағири вақти интишор
+• `/forcepost` - Интишори форӣ
+
+❓ `/help` - Ин паём
+
+**Маълумот:**
+• Ҳадди аксари навбат: {max_queue} филм
+• Вақти кунунии интишор: {post_time}
+• Филмҳо ҳар рӯз ба таври худкор интишор мешаванд
+    """.format(
+        max_queue=MAX_QUEUE_SIZE,
+        post_time=bot_data.post_time
+    )
+    
+    bot.reply_to(message, help_text, parse_mode='Markdown')
+    logger.info(f"Администратор фармони help-ро дархост кард")
+
+@bot.message_handler(commands=['status'])
+def handle_status(message):
+    """Коркарди фармони /status"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    queue_count = len(bot_data.movie_queue)
+    next_movie = bot_data.movie_queue[0]['caption'] if bot_data.movie_queue else "Ҳеҷ филм дар навбат нест"
+    next_post_time = get_next_post_time()
+    
+    status_text = f"""
+📊 **Вазъи кунунӣ:**
+
+🎬 Филмҳо дар навбат: {queue_count}/{MAX_QUEUE_SIZE}
+⏰ Вақти интишор: {bot_data.post_time}
+🕐 Интишори навбатӣ: {next_post_time}
+🎭 Филми навбатӣ: {next_movie}
+📅 Охирин интишор: {bot_data.last_post_date if bot_data.last_post_date else 'Ҳанӯз интишор нашудааст'}
+    """
+    
+    bot.reply_to(message, status_text, parse_mode='Markdown')
+    logger.info("Администратор маълумоти status-ро дархост кард")
+
+@bot.message_handler(commands=['listmovies'])
+def handle_list_movies(message):
+    """Коркарди фармони /listmovies"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    if not bot_data.movie_queue:
+        bot.reply_to(message, "📝 Навбати филмҳо холӣ аст.")
+        return
+    
+    movies_text = "📝 **Рӯйхати филмҳо дар навбат:**\n\n"
+    for i, movie in enumerate(bot_data.movie_queue, 1):
+        caption = movie.get('caption', 'Бе сарлавҳа')
+        movies_text += f"{i}. {caption}\n"
+    
+    bot.reply_to(message, movies_text, parse_mode='Markdown')
+    logger.info("Администратор рӯйхати филмҳоро дархост кард")
+
+@bot.message_handler(commands=['remove'])
+def handle_remove_movie(message):
+    """Коркарди фармони /remove"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    try:
+        # Гирифтани рақами филм аз фармон
+        args = message.text.split()
+        if len(args) != 2:
+            bot.reply_to(message, "❌ Истифодаи дуруст: /remove <рақам>\nМисол: /remove 2")
+            return
+        
+        movie_index = int(args[1]) - 1  # Табдил ба index (аз 0 шурӯъ мешавад)
+        
+        if movie_index < 0 or movie_index >= len(bot_data.movie_queue):
+            bot.reply_to(message, f"❌ Рақами нодуруст. Рақам бояд аз 1 то {len(bot_data.movie_queue)} бошад.")
+            return
+        
+        # Нест кардани филм
+        removed_movie = bot_data.movie_queue.pop(movie_index)
+        save_data()
+        
+        bot.reply_to(
+            message, 
+            f"✅ Филм аз навбат нест карда шуд:\n📝 {removed_movie.get('caption', 'Бе сарлавҳа')}"
+        )
+        logger.info(f"Филм аз навбат нест карда шуд: {removed_movie.get('caption', 'Бе сарлавҳа')}")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Рақами нодуруст. Лутфан рақами дуруст ворид кунед.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Хатогӣ: {str(e)}")
+        logger.error(f"Хатогӣ ҳангоми нест кардани филм: {e}")
+
+@bot.message_handler(commands=['settime'])
+def handle_set_time(message):
+    """Коркарди фармони /settime"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    try:
+        # Гирифтани вақт аз фармон
+        args = message.text.split()
+        if len(args) != 2:
+            bot.reply_to(message, "❌ Истифодаи дуруст: /settime HH:MM\nМисол: /settime 14:30")
+            return
+        
+        new_time = args[1]
+        
+        # Санҷиши формати вақт
+        time_parts = new_time.split(':')
+        if len(time_parts) != 2:
+            raise ValueError("Формати нодуруст")
+        
+        hour, minute = int(time_parts[0]), int(time_parts[1])
+        
+        if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+            raise ValueError("Вақти нодуруст")
+        
+        # Танзими вақти нав
+        bot_data.post_time = new_time
+        setup_scheduler()  # Навсозии ҷадвал
+        save_data()
+        
+        bot.reply_to(
+            message, 
+            f"✅ Вақти интишор тағир дода шуд ба: {new_time}\n"
+            f"⏰ Интишори навбатӣ: {get_next_post_time()}"
+        )
+        logger.info(f"Вақти интишор тағир дода шуд ба: {new_time}")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Формати вақт нодуруст. Истифода баред: HH:MM (масалан, 14:30)")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Хатогӣ: {str(e)}")
+        logger.error(f"Хатогӣ ҳангоми тағири вақт: {e}")
+
+@bot.message_handler(commands=['forcepost'])
+def handle_force_post(message):
+    """Коркарди фармони /forcepost"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    if not bot_data.movie_queue:
+        bot.reply_to(message, "❌ Навбати филмҳо холӣ аст.")
+        return
+    
+    bot.reply_to(message, "⏳ Интишори филм...")
+    post_movie()
+    
+    logger.info("Администратор интишори форӣ дархост кард")
+
+@bot.message_handler(content_types=['video'])
+def handle_video(message):
+    """Коркарди файлҳои видеоӣ"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    try:
+        # Санҷиши ҷои холӣ дар навбат
+        if len(bot_data.movie_queue) >= MAX_QUEUE_SIZE:
+            bot.reply_to(
+                message, 
+                f"❌ Навбат пур аст! (Ҳадди аксар: {MAX_QUEUE_SIZE})\n"
+                f"Лутфан якчанд филмро нест кунед ё интизор шавед."
+            )
+            return
+        
+        # Илова кардани филм ба навбат
+        movie_data = {
+            'file_id': message.video.file_id,
+            'caption': message.caption or f"Филм #{len(bot_data.movie_queue) + 1}",
+            'added_date': datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        
+        bot_data.movie_queue.append(movie_data)
+        save_data()
+        
+        bot.reply_to(
+            message,
+            f"✅ Филм ба навбат илова карда шуд!\n\n"
+            f"📝 Сарлавҳа: {movie_data['caption']}\n"
+            f"🔢 Ҷойи дар навбат: {len(bot_data.movie_queue)}\n"
+            f"⏰ Интишори тахминӣ: {get_next_post_time()}"
+        )
+        
+        logger.info(f"Филми нав илова карда шуд: {movie_data['caption']}")
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Хатогӣ ҳангоми илова кардани филм: {str(e)}")
+        logger.error(f"Хатогӣ ҳангоми коркарди видео: {e}")
+
+@bot.message_handler(func=lambda message: True)
+def handle_other_messages(message):
+    """Коркарди дигар паёмҳо"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Шумо ҳуқуқи истифодаи ин ботро надоред.")
+        return
+    
+    bot.reply_to(
+        message, 
+        "❓ Фармони номаълум. Барои дидани фармонҳои дастрас /help-ро истифода баред."
+    )
+
+# ==================== ФУНКСИЯИ АСОСӢ ====================
+def main():
+    """Функсияи асосии барнома"""
+    logger.info("Оғози кори бот...")
+    
+    try:
+        # Бор кардани маълумот
+        load_data()
+        
+        # Танзими ҷадвал
+        setup_scheduler()
+        
+        # Оғози thread барои ҷадвал
+        scheduler_thread_obj = threading.Thread(target=scheduler_thread, daemon=True)
+        scheduler_thread_obj.start()
+        
+        logger.info("Бот омода аст!")
+        
+        # Огоҳ кардани администратор дар бораи оғози кор
+        try:
+            bot.send_message(
+                ADMIN_USER_ID,
+                f"🚀 Бот оғоз ёфт!\n\n"
+                f"📊 Филмҳо дар навбат: {len(bot_data.movie_queue)}\n"
+                f"⏰ Вақти интишор: {bot_data.post_time}\n"
+                f"🕐 Интишори навбатӣ: {get_next_post_time()}"
+            )
+        except Exception as e:
+            logger.error(f"Наметавонад ба администратор паём фиристад: {e}")
+        
+        # Оғози polling
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        
+    except KeyboardInterrupt:
+        logger.info("Бот аз ҷониби корбар қатъ карда шуд")
+    except Exception as e:
+        logger.error(f"Хатогии умумӣ: {e}")
+    finally:
+        logger.info("Бот қатъ карда шуд")
+
 if __name__ == "__main__":
-    print("🤖 Бот бо функсияҳои ҷазобтар оғоз шуд...")
-    bot.infinity_polling()
+    main()
